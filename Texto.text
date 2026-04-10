@@ -1,0 +1,326 @@
+MONITOR DE TRANSFERÊNCIAS DO GOVERNO FEDERAL
+
+Alunos:
+1. João Camilo Mallmann
+2. Matheus Augusto Lemes
+3. Henrique Kafer
+4. Leonardo Koelzer Mendes
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+1. INTRODUÇÃO E JUSTIFICATIVA DO PROJETO
+1.1. O Contexto dos Dados Abertos no Brasil
+Em atendimento à proposta da disciplina de criar relatórios gráficos com informações inéditas e relevantes a partir de bases de dados abertas, a nossa equipe desenvolveu o projeto Monitor de Transferências do Governo Federal. Este trabalho se apoia fundamentalmente nos pilares da transparência pública e da democratização do acesso à informação, preceitos que foram institucionalizados no Brasil pela Lei de Acesso à Informação (LAI - Lei nº 12.527/2011).
+Embora o governo disponibilize um vasto volume de dados brutos, a sociedade civil e os próprios gestores públicos frequentemente esbarram em uma barreira técnica: a dificuldade de processar planilhas massivas e extrair conhecimento acionável. É nesse cenário que a tecnologia e, mais especificamente, as ferramentas de Business Intelligence (BI), assumem um papel vital para auditar e compreender a real destinação dos impostos arrecadados.
+1.2. O Papel do Business Intelligence e o Objetivo do Estudo
+O objetivo central deste projeto é relatar detalhadamente todo o procedimento técnico — desde a complexa engenharia de extração (ETL) até a concepção analítica dos visuais — para mapear a destinação, a eficiência de liberação financeira e a situação (status legal) dos recursos públicos federais repassados a estados, municípios e entidades do terceiro setor (ONGs, fundações, etc.).
+A escolha deste tema justifica-se pela necessidade premente de compreender não apenas "para onde" o dinheiro vai, mas a "velocidade e a qualidade" dessa alocação. Na gestão pública, um recurso empenhado não significa necessariamente um benefício entregue à população. Nossos dashboards permitem auditar a regularidade dos convênios e, principalmente, comparar a eficiência da execução orçamentária entre diferentes regiões do país. Para consubstanciar essa análise, adotamos como estudos de caso focais duas capitais com perfis demográficos e administrativos distintos: Porto Alegre (RS) e João Pessoa (PB).
+2. ARQUITETURA DE DADOS: OBTENÇÃO E EXTRAÇÃO (ETL AVANÇADO)
+Para cumprir o requisito acadêmico de utilizar bases de dados abertas governamentais de forma inovadora, decidimos não depender de downloads manuais de planilhas estáticas. Em vez disso, construímos um pipeline de extração conectando-nos diretamente à API REST do Portal da Transparência do Governo Federal.
+2.1. Extração Automatizada via API (Script em Python)
+O Portal da Transparência segmenta seus dados massivos em paginações curtas para evitar sobrecargas em seus servidores. Para contornar a inviabilidade de baixar milhares de fragmentos manualmente, a equipe desenvolveu um script em linguagem Python dedicado à automação dessa requisição.
+A restrição técnica central da API é que o endpoint /api-de-dados/convenios aceita um período máximo de 1 dia por requisição. A estratégia adotada foi, portanto, iterar dia a dia de 01/01/2025 a 31/12/2025, totalizando até 365 chamadas ao servidor. Dias sem registros são silenciosamente ignorados, mantendo o pipeline eficiente. O código implementa ainda: paginação automática (avança páginas até receber lista vazia); sistema de retry com até 3 tentativas por dia, com tratamento diferenciado para cada código HTTP (200, 204, 400, 401/403, 429); achatamento (flatten) recursivo do JSON aninhado via separador "__", com descarte de listas de objetos incompatíveis com o Power BI; e exportação final em CSV com separador ";" e encoding UTF-8-BOM.
+
+Listagem 1 – Script Python de extração (ETL)
+"""
+ETL - Convênios do Poder Executivo Federal
+Município: Lajeado - RS (IBGE: 4311403)
+Ano de Referência: 2025
+
+ATENÇÃO: A API impõe período MÁXIMO DE 1 DIA por requisição.
+Estratégia: loop dia a dia (01/01/2025 → 31/12/2025) = até 365 requisições.
+Para minimizar chamadas desnecessárias, dias sem dados são pulados silenciosamente.
+"""
+
+import requests
+import pandas as pd
+import time
+import os
+import logging
+from datetime import date, timedelta
+
+# ---------------------------------------------------------------------------
+# CONFIGURAÇÃO
+# ---------------------------------------------------------------------------
+CHAVE_API   = "SUA_CHAVE_AQUI"
+CODIGO_IBGE = "4311403"          # Lajeado - RS
+ANO         = 2025
+BASE_URL    = "https://api.portaldatransparencia.gov.br/api-de-dados"
+PASTA_SAIDA = "dados_lajeado_2025"
+DELAY_OK    = 0.8   # pausa entre requisições bem-sucedidas (segundos)
+DELAY_ERRO  = 10    # pausa após erro 429 / 500 (segundos)
+MAX_RETRIES = 3     # tentativas por dia antes de desistir
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger(__name__)
+
+os.makedirs(PASTA_SAIDA, exist_ok=True)
+
+HEADERS = {
+    "chave-api-dados": CHAVE_API,
+    "accept":          "application/json",
+    "User-Agent":      "Mozilla/5.0 (ETL-Convenios-Lajeado/1.0)",
+}
+
+
+# ---------------------------------------------------------------------------
+# FLATTEN
+# ---------------------------------------------------------------------------
+def flatten_row(row: dict, prefix: str = "") -> dict:
+    """
+    Achata recursivamente dicionários aninhados com separador '__'.
+    Listas de valores simples → string separada por '; '.
+    Listas de objetos → descartadas (evitam quebrar o Power BI / Excel).
+    """
+    flat = {}
+    for k, v in row.items():
+        chave = f"{prefix}{k}" if not prefix else f"{prefix}__{k}"
+        if isinstance(v, dict):
+            flat.update(flatten_row(v, prefix=chave))
+        elif isinstance(v, list):
+            if v and isinstance(v[0], dict):
+                pass  # lista de objetos: descarta
+            else:
+                flat[chave] = "; ".join(str(i) for i in v)
+        else:
+            flat[chave] = v
+    return flat
+
+
+# ---------------------------------------------------------------------------
+# REQUISIÇÃO COM RETRY
+# ---------------------------------------------------------------------------
+def get_pagina(data_str: str, pagina: int) -> list | None:
+    """
+    Consulta /convenios para UMA data específica e UMA página.
+    Retorna lista de registros, [] se vazio, None em caso de erro permanente.
+    """
+    url = f"{BASE_URL}/convenios"
+    params = {
+        "dataInicial": data_str,
+        "dataFinal":   data_str,   # mesmo dia = período de 1 dia
+        "pagina":      pagina,
+    }
+
+    for tentativa in range(1, MAX_RETRIES + 1):
+        try:
+            resp = requests.get(url, headers=HEADERS, params=params, timeout=30)
+        except requests.exceptions.RequestException as e:
+            log.warning(f"    Conexão falhou (tentativa {tentativa}/{MAX_RETRIES}): {e}")
+            time.sleep(DELAY_ERRO)
+            continue
+
+        if resp.status_code == 200:
+            dados = resp.json()
+            return dados if isinstance(dados, list) else []
+
+        if resp.status_code == 204:   # No Content
+            return []
+
+        if resp.status_code == 429:
+            log.warning(f"    Rate limit (429). Aguardando {DELAY_ERRO}s...")
+            time.sleep(DELAY_ERRO)
+            continue
+
+        if resp.status_code in (401, 403):
+            log.error("    Chave de API inválida ou sem permissão. Encerrando.")
+            raise SystemExit(1)
+
+        if resp.status_code == 400:
+            log.debug(f"    HTTP 400 em {data_str} p.{pagina}: {resp.text[:120]}")
+            return []
+
+        log.warning(f"    HTTP {resp.status_code} (tentativa {tentativa}/{MAX_RETRIES}): {resp.text[:120]}")
+        time.sleep(DELAY_ERRO)
+
+    log.error(f"    Falha permanente em {data_str} página {pagina}. Pulando.")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# LOOP PRINCIPAL
+# ---------------------------------------------------------------------------
+def extrair_convenios_2025():
+    inicio_periodo = date(ANO, 1, 1)
+    fim_periodo    = date(ANO, 12, 31)
+
+    todos_registros = []
+    dias_com_dados  = 0
+    dias_sem_dados  = 0
+    dias_com_erro   = 0
+
+    data_atual = inicio_periodo
+    total_dias = (fim_periodo - inicio_periodo).days + 1
+
+    log.info("=" * 65)
+    log.info(f"ETL Convênios — Lajeado/RS (IBGE {CODIGO_IBGE}) — {ANO}")
+    log.info(f"Período: {inicio_periodo:%d/%m/%Y} → {fim_periodo:%d/%m/%Y} ({total_dias} dias)")
+    log.info("=" * 65)
+
+    while data_atual <= fim_periodo:
+        data_str = data_atual.strftime("%d/%m/%Y")
+        pagina   = 1
+        registros_do_dia = []
+
+        while True:
+            resultado = get_pagina(data_str, pagina)
+
+            if resultado is None:          # erro permanente
+                dias_com_erro += 1
+                break
+
+            if not resultado:              # lista vazia = sem mais dados
+                break
+
+            registros_do_dia.extend(resultado)
+            pagina += 1
+            time.sleep(DELAY_OK)
+
+        if registros_do_dia:
+            todos_registros.extend(registros_do_dia)
+            dias_com_dados += 1
+            log.info(f"  {data_str}  →  {len(registros_do_dia):>4} registro(s)  "
+                     f"(acumulado: {len(todos_registros):,})")
+        else:
+            dias_sem_dados += 1
+            if dias_sem_dados % 30 == 1:
+                log.debug(f"  {data_str}  →  sem registros")
+
+        data_atual += timedelta(days=1)
+        time.sleep(DELAY_OK)
+
+    # -----------------------------------------------------------------------
+    # SALVAR
+    # -----------------------------------------------------------------------
+    log.info(f"Dias com dados : {dias_com_dados}")
+    log.info(f"Dias sem dados : {dias_sem_dados}")
+    log.info(f"Dias com erro  : {dias_com_erro}")
+    log.info(f"Total registros: {len(todos_registros):,}")
+
+    if not todos_registros:
+        log.warning("Nenhum convênio encontrado. Verifique CODIGO_IBGE e CHAVE_API.")
+        return
+
+    df = pd.DataFrame([flatten_row(r) for r in todos_registros])
+
+    colunas_data = [c for c in df.columns if "data" in c.lower()]
+    for col in colunas_data:
+        df[col] = pd.to_datetime(df[col], errors="coerce").dt.strftime("%d/%m/%Y")
+
+    nome_arquivo = f"Fato_Convenios_Lajeado_{ANO}.csv"
+    caminho      = os.path.join(PASTA_SAIDA, nome_arquivo)
+    df.to_csv(caminho, index=False, sep=";", encoding="utf-8-sig")
+
+    log.info(f"Arquivo salvo: '{caminho}'")
+    log.info(f"{len(df):,} linhas x {len(df.columns)} colunas")
+
+
+# ---------------------------------------------------------------------------
+# EXECUÇÃO
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    extrair_convenios_2025()
+Fonte: elaborado pelos autores (2025).
+2.2. Dicionário de Variáveis e Estrutura do Arquivo (Fato)
+Após a execução do script Python, a complexa árvore de dados JSON é achatada (flattened) em uma estrutura tabular tradicional, exportada no arquivo Fato_Convenios_Lajeado_2025.csv. Esta tabela atua como a Tabela Fato primária no modelo relacional do Power BI, possuindo granularidade fina: cada linha representa o ciclo de vida de um convênio individual firmado entre a União e um convenente.
+O entendimento semântico das colunas foi vital para a modelagem:
+–  Chaves de Identificação (IDs): id, dimConvenio__numero, numeroProcesso. Garantem a rastreabilidade unívoca do contrato.
+–  Temporalidade (Datas): dataInicioVigencia, dataFinalVigencia, dataConclusao. Indicadores de ciclo de vida essenciais.
+–  Localidade (Geografia): municipioConvenente__codigoIBGE, municipioConvenente__nomeIBGE, municipioConvenente__uf__sigla. Dados de segmentação categórica.
+–  Entidade Convenente (Ator): convenente__nome, convenente__tipo.
+–  Valores Financeiros (Fatos Quantitativos): valor — montante pactuado; valorLiberado — quantia efetivamente transferida; valorContrapartida — investimento exigido do ente local.
+–  Status do Projeto: situacao. O termômetro de governança do projeto ("EM EXECUÇÃO", "ADIMPLENTE", "CONCLUÍDO", etc.).
+
+3. TRATAMENTO E MODELAGEM DE DADOS (POWER QUERY E DAX)
+3.1. Limpeza e Higienização no Power Query (Data Quality)
+–  Tipagem Criteriosa e Localização: conversão rigorosa das colunas (valor, valorLiberado, valorContrapartida) para o tipo Número Decimal Fixo / Moeda, com configuração regional em "Português (Brasil)".
+–  Padronização Textual de Categorias: na coluna qualitativa situacao, aplicaram-se funções de transformação de texto (Maiúsculas e Trim) para evitar duplicidades errôneas nos gráficos de pizza.
+–  Criação de Colunas Físicas Temporais: criou-se a coluna Ano Inicio Vigencia = YEAR([dataInicioVigencia]) para uso no eixo dos gráficos.
+3.2. Medidas Dinâmicas (DAX)
+Optamos pelas melhores práticas de BI, desenvolvendo um conjunto de medidas explícitas em linguagem DAX. A seguir, as medidas utilizadas e sua respectiva função no projeto:
+
+Medida DAX
+Função
+Total Convenios
+Contabilizar o volume administrativo (número de linhas).
+Valor Total
+Somar o montante financeiro macro pactuado.
+Valor Liberado
+Somar apenas o montante que já foi repassado pela União.
+Contrapartida Total
+Somar o valor injetado pelo próprio município/estado.
+Valor por Ano
+Somar os recursos para viabilizar análises anuais em gráficos.
+
+Quadro 1 – Medidas DAX do modelo. Fonte: elaborado pelos autores (2025).
+4. ESTRUTURAÇÃO DOS DASHBOARDS E ANÁLISE VISUAL
+O projeto final resultou em três painéis visuais complementares, desenhados com uma paleta azul sóbria, focados em guiar a análise do cenário nacional para o municipal.
+Dashboard 1: Visão Geral Nacional
+–  Cartões de KPI: Apresentam o volume total de convênios consolidados e a taxa de execução financeira macro no Brasil.
+–  Gráfico de Pizza (Saúde dos Contratos): Ilustra a proporção da conformidade legal dos projetos, evidenciando visualmente que a maioria absoluta dos convênios se encontra de forma regular nas fatias de status concluído ou adimplente.
+–  Gráfico de Linha (Evolução Histórica): Demonstra a sazonalidade e a linha do tempo, destacando picos históricos de novas assinaturas e repasses financeiros decorrentes de políticas públicas passadas.
+–  Gráfico de Barras (Maiores Repasses): Filtra e exibe os principais recebedores institucionais e estatais de recursos no país através do recurso analítico de Top N.
+Dashboard 2: Eficiência Local — Porto Alegre (RS)
+–  Gráfico de Rosca (Execução): Expõe a eficiência orçamentária da capital gaúcha, contrastando a imensa fatia de verba que já foi liberada aos cofres locais contra a pequena parcela ainda retida em trânsito burocrático.
+–  Análise de Maturidade: Os visuais de apoio demonstram a altíssima taxa de projetos regulares e a proeminência de projetos já concluídos na gestão da cidade.
+Dashboard 3: O Paradoxo da Liberação — João Pessoa (PB)
+–  Análise de Gargalo: O painel revela um cenário focado em megaobras e alto valor agregado. Os visuais contrastam a perfeita regularidade legal da cidade com a lentidão na liberação do dinheiro, ilustrando graficamente a retenção da maior parte das verbas pactuadas por parte da União.
+Dashboard 4: Indicadores Gerais
+Cartões de KPI (Alcance e Capilaridade): Apresentam o impacto territorial e institucional dos recursos, evidenciando de forma direta o alcance da política pública ao quantificar os municípios atendidos (932) e o vasto volume de entidades recebedoras mobilizadas (1.459).
+Gráfico de Área (Evolução Histórica de Liberação): Demonstra a trajetória do fluxo de caixa e a execução financeira real ao longo do tempo. O visual ilustra a sazonalidade das transferências, destacando os picos históricos e os ciclos em que o dinheiro efetivamente saiu dos cofres da União para os executores locais.
+Matriz de Detalhamento (Distribuição por Órgão): Estrutura a hierarquia orçamentária governamental. O componente detalha a carteira de projetos por Ministério (com destaque para pastas de alto volume, como Integração e Saúde) e cruza essas informações com o status de conformidade (Adimplente), permitindo uma auditoria rápida da saúde institucional.
+Gráfico de Dispersão (Relação de Complexidade): Analisa a correlação entre o montante financeiro investido (Valor do Repasse) e o tempo exigido para a conclusão (Prazo de Execução). O cruzamento expõe visualmente a densidade dos contratos e facilita a identificação de outliers — como megaobras e projetos de alta complexidade que demandam tanto cifras bilionárias quanto prazos de vigência estendidos.
+
+4.1. Conclusão da Hipótese Comparativa (POA vs JP)
+O abismo verificado entre a liberação real entre Porto Alegre e João Pessoa comprova que estar "Adimplente" de forma burocrática não garante liquidez na entrega de valor ao cidadão. O painel sugere que a Paraíba pode estar lidando com megaprojetos recentes em fase de aprovações ou com gargalos logísticos severos na etapa de medição física de obras.
+4.2. LINK DO VIDEO
+
+https://www.youtube.com/watch?v=5HyXJjnrL9U
+5. ANEXOS TÉCNICOS E REFERÊNCIA DE CÓDIGO DO PROJETO
+Abaixo consolidamos o dicionário lógico das expressões matemáticas parametrizadas através da opção New Measure no Power BI Desktop.
+5.1. Medidas (criar como NEW MEASURE)
+
+Total Convenios =
+COUNTROWS('Fato_Convenios_Lajeado_2025')
+
+Valor Total =
+SUM('Fato_Convenios_Lajeado_2025'[valor])
+
+Valor Liberado =
+SUM('Fato_Convenios_Lajeado_2025'[valorLiberado])
+
+Contrapartida Total =
+SUM('Fato_Convenios_Lajeado_2025'[valorContrapartida])
+
+Valor por Ano =
+SUM('Fato_Convenios_Lajeado_2025'[valor])
+
+5.2. Arquitetura de Visuais
+–  Gráfico de Linha (Evolução Histórica): O Eixo X foi parametrizado apenas na granularidade anual baseando-se na coluna Ano Inicio Vigencia, ativando os Markers e Data Labels.
+–  Barras Horizontais (Top 3): No painel oculto de Filtros Nativos, ativou-se a restrição Top N=3, balizada imperativamente pelo valor da medida [Valor Total].
+–  Harmonia e Alinhamentos: Utilizamos o recurso nativo da aba Format (Align e Distribute horizontally) para a simetria perfeita dos cartões de KPI no topo da tela.
+
